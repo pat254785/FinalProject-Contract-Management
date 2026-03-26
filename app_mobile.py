@@ -269,15 +269,25 @@ def main(page: ft.Page):
     # ====== Layout ======
     header_title = ft.Text("Overview", color=ft.Colors.BLACK87, size=20, weight=ft.FontWeight.W_700)
 
-    header = ft.AppBar(
+    # Use a plain Container header instead of AppBar to avoid
+    # "Unknown control: appbar" on some web/mobile runtimes.
+    header = ft.Container(
         bgcolor="#fce588",
-        leading=ft.Icon(ft.Icons.MENU, color=ft.Colors.BLACK87),
-        title=ft.Row(
-            spacing=8,
+        padding=ft.Padding(12, 12, 12, 12),
+        content=ft.Row(
+            alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
             vertical_alignment=ft.CrossAxisAlignment.CENTER,
             controls=[
-                header_title,
-                ft.Icon(ft.Icons.KEYBOARD_ARROW_DOWN, color=ft.Colors.BLACK87),
+                ft.Icon(ft.Icons.MENU, color=ft.Colors.BLACK87),
+                ft.Row(
+                    spacing=8,
+                    vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                    controls=[
+                        header_title,
+                        ft.Icon(ft.Icons.KEYBOARD_ARROW_DOWN, color=ft.Colors.BLACK87),
+                    ],
+                ),
+                ft.Container(width=24),  # spacer to balance left icon
             ],
         ),
     )
@@ -679,15 +689,19 @@ def main(page: ft.Page):
             options=vendor_options,
         )
 
-        selected_image = {"path": None, "file_type": None, "name": None}
+        selected_image = {"path": None, "bytes": None, "file_type": None, "name": None}
         image_label = ft.Text("No image selected", size=12, color=ft.Colors.GREY_600)
 
         error_text = ft.Text("", color=ft.Colors.RED_400, size=12)
 
-        # NOTE:
-        # ในเครื่อง/รันไทม์ของผู้ใช้บางเวอร์ชัน Flet แสดงผลไม่รองรับ `ft.FilePicker`
-        # เลยขึ้น `Unknown control: FilePicker` ทำให้หน้าเพี้ยน
-        # เราจะใช้ `tkinter.filedialog` แทนเพื่อเปิดหน้าต่างเลือกไฟล์แทน
+        # FilePicker as Service (not overlay control) for web/mobile in-page picking.
+        image_picker = None
+        if hasattr(page, "services"):
+            image_picker = next((s for s in page.services if isinstance(s, ft.FilePicker)), None)
+            if image_picker is None:
+                image_picker = ft.FilePicker()
+                page.services.append(image_picker)
+
         def _pick_path() -> str:
             from tkinter import Tk, filedialog
 
@@ -706,22 +720,69 @@ def main(page: ft.Page):
             finally:
                 root.destroy()
 
-        def pick_image_click(e):
+        def _apply_selected_path(path_value: str):
+            path_value = (path_value or "").strip()
+            if not path_value:
+                selected_image["path"] = None
+                selected_image["bytes"] = None
+                selected_image["file_type"] = None
+                selected_image["name"] = None
+                image_label.value = "No image selected"
+                return
+            ext = os.path.splitext(path_value)[1].lower().lstrip(".")
+            selected_image["path"] = path_value
+            selected_image["bytes"] = None
+            selected_image["file_type"] = ext
+            selected_image["name"] = os.path.basename(path_value)
+            image_label.value = f"Selected: {selected_image['name']}"
+
+        async def pick_image_click(e):
+            # Prefer FilePicker service whenever available.
+            # In some Flet runtimes, `page.web` may be False even when opened from phone browser.
+            # Using service availability is more reliable and allows mobile-native picker UI.
+            if image_picker is not None:
+                try:
+                    files = None
+                    try:
+                        files = await image_picker.pick_files(
+                            dialog_title="Select image",
+                            allowed_extensions=["jpg", "jpeg", "png", "webp"],
+                            allow_multiple=False,
+                            with_data=True,
+                        )
+                    except TypeError:
+                        files = await image_picker.pick_files(
+                            dialog_title="Select image",
+                            allowed_extensions=["jpg", "jpeg", "png", "webp"],
+                            allow_multiple=False,
+                        )
+
+                    if files:
+                        first = files[0]
+                        picked_name = getattr(first, "name", None) or "upload_image"
+                        picked_path = getattr(first, "path", None)
+                        picked_bytes = getattr(first, "bytes", None)
+                        ext = os.path.splitext(picked_name)[1].lower().lstrip(".")
+                        selected_image["path"] = picked_path
+                        selected_image["bytes"] = picked_bytes
+                        selected_image["file_type"] = ext
+                        selected_image["name"] = picked_name
+                        image_label.value = f"Selected: {picked_name}"
+                        error_text.value = ""
+                    else:
+                        # user cancelled picker
+                        error_text.value = ""
+                except Exception as ex:
+                    error_text.value = f"Pick image failed: {str(ex)}"
+                page.update()
+                return
             try:
                 picked_path = _pick_path()
                 if picked_path:
-                    ext = os.path.splitext(picked_path)[1].lower().lstrip(".")
-                    picked_name = os.path.basename(picked_path)
-                    selected_image["path"] = picked_path
-                    selected_image["file_type"] = ext
-                    selected_image["name"] = picked_name
-                    image_label.value = f"Selected: {picked_name}"
+                    _apply_selected_path(picked_path)
                     error_text.value = ""
                 else:
-                    selected_image["path"] = None
-                    selected_image["file_type"] = None
-                    selected_image["name"] = None
-                    image_label.value = "No image selected"
+                    _apply_selected_path("")
                     error_text.value = ""
             except Exception as ex:
                 error_text.value = f"Pick image failed: {str(ex)}"
@@ -774,8 +835,9 @@ def main(page: ft.Page):
                 # This ensures `file_type` is set by the API based on the uploaded file name.
                 upload_failed = False
                 upload_error = ""
-                if selected_image.get("path"):
+                if selected_image.get("path") or selected_image.get("bytes"):
                     try:
+                        import base64
                         import requests
 
                         api_url_env = os.environ.get("API_URL", "http://127.0.0.1:3500")
@@ -788,32 +850,70 @@ def main(page: ft.Page):
                         # De-duplicate while preserving order
                         api_urls = [u for i, u in enumerate(api_urls) if u and u not in api_urls[:i]]
 
-                        image_path = selected_image["path"]
-                        if not os.path.exists(image_path):
-                            raise FileNotFoundError(f"Image not found: {image_path}")
+                        filename = selected_image.get("name") or "upload_image"
+                        image_path = selected_image.get("path")
+                        image_bytes = selected_image.get("bytes")
 
-                        with open(image_path, "rb") as f:
-                            file_bytes = f.read()
-                        filename = os.path.basename(image_path)
+                        if image_bytes is not None:
+                            if isinstance(image_bytes, (bytes, bytearray)):
+                                file_bytes = bytes(image_bytes)
+                            elif isinstance(image_bytes, str):
+                                # Some runtimes may return base64 string.
+                                file_bytes = base64.b64decode(image_bytes)
+                            else:
+                                file_bytes = bytes(image_bytes)
+                        else:
+                            # If file does not exist on local machine (e.g. uploaded on phone
+                            # via API temp upload), attach existing server file path directly.
+                            if image_path and not os.path.exists(image_path):
+                                attached = False
+                                attach_err = None
+                                for base in api_urls:
+                                    try:
+                                        resp = requests.post(
+                                            f"{base}/contract-documents/attach-existing",
+                                            json={
+                                                "contract_id": contract_id,
+                                                "file_path": image_path,
+                                                "file_type": selected_image.get("file_type") or "",
+                                            },
+                                            timeout=20,
+                                        )
+                                        if resp.ok:
+                                            attached = True
+                                            break
+                                        attach_err = RuntimeError(f"HTTP {resp.status_code}: {resp.text}")
+                                    except Exception as ex:
+                                        attach_err = ex
+                                if not attached:
+                                    raise attach_err or RuntimeError("Attach existing image failed")
+                                file_bytes = None
+                            else:
+                                if not image_path or not os.path.exists(image_path):
+                                    raise FileNotFoundError(f"Image not found: {image_path}")
+                                with open(image_path, "rb") as f:
+                                    file_bytes = f.read()
+                                filename = os.path.basename(image_path)
 
-                        last_exc = None
-                        resp = None
-                        for base in api_urls:
-                            try:
-                                resp = requests.post(
-                                    f"{base}/contract-documents/upload",
-                                    data={"contract_id": contract_id},
-                                    files={"file": (filename, file_bytes)},
-                                    timeout=20,
-                                )
-                                if resp.ok:
-                                    break
-                                last_exc = RuntimeError(f"HTTP {resp.status_code}: {resp.text}")
-                            except Exception as ex:
-                                last_exc = ex
+                        if file_bytes is not None:
+                            last_exc = None
+                            resp = None
+                            for base in api_urls:
+                                try:
+                                    resp = requests.post(
+                                        f"{base}/contract-documents/upload",
+                                        data={"contract_id": contract_id},
+                                        files={"file": (filename, file_bytes)},
+                                        timeout=20,
+                                    )
+                                    if resp.ok:
+                                        break
+                                    last_exc = RuntimeError(f"HTTP {resp.status_code}: {resp.text}")
+                                except Exception as ex:
+                                    last_exc = ex
 
-                        if resp is None or not resp.ok:
-                            raise last_exc or RuntimeError("Unknown upload error")
+                            if resp is None or not resp.ok:
+                                raise last_exc or RuntimeError("Unknown upload error")
                     except Exception as ex:
                         upload_failed = True
                         upload_error = str(ex)

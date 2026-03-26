@@ -1,4 +1,5 @@
 from fastapi import FastAPI, HTTPException, UploadFile, File, Form
+from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 import mariadb
 from fastapi.middleware.cors import CORSMiddleware
@@ -73,6 +74,12 @@ class ContractDocument(ContractDocumentBase):
 class ContractDocumentUpdate(BaseModel):
     contract_id: Optional[int] = None
     file_path: Optional[str] = None
+    file_type: Optional[str] = None
+
+
+class ContractDocumentAttachExistingRequest(BaseModel):
+    contract_id: int
+    file_path: str
     file_type: Optional[str] = None
 
 # Notifications Models
@@ -425,6 +432,8 @@ def delete_contract_document(doc_id: int):
 # ========================
 
 CONTRACT_DOCUMENT_UPLOAD_DIR = os.environ.get("CONTRACT_DOCUMENT_UPLOAD_DIR", "uploads/contract_documents")
+MOBILE_PICKER_UPLOAD_DIR = os.environ.get("MOBILE_PICKER_UPLOAD_DIR", "uploads/mobile_picker")
+MOBILE_UPLOAD_RESULTS = {}  # token -> {file_path, file_name, file_type}
 
 
 def _infer_file_type(filename: str) -> str:
@@ -435,6 +444,128 @@ def _infer_file_type(filename: str) -> str:
 def _safe_filename(filename: str) -> str:
     # Avoid path traversal; keep only basename.
     return os.path.basename(filename or "").replace("..", "")
+
+
+@app.get("/mobile-image-upload-form", response_class=HTMLResponse)
+def mobile_image_upload_form():
+    # Browser-native file input page (works on phone browser).
+    return """
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Upload image from phone</title>
+  <style>
+    body { font-family: Arial, sans-serif; margin: 20px; }
+    .box { max-width: 420px; margin: 0 auto; }
+    input, button { font-size: 16px; margin-top: 10px; width: 100%; }
+    .hint { color: #666; font-size: 13px; margin-top: 10px; }
+    .ok { color: #0b6b3b; font-weight: 700; margin-top: 12px; word-break: break-all; }
+    .err { color: #c62828; margin-top: 12px; word-break: break-all; }
+  </style>
+</head>
+<body>
+  <div class="box">
+    <h3>Upload image from phone</h3>
+    <input id="file" type="file" accept="image/*" />
+    <button id="btn">Upload</button>
+    <div class="hint">เลือกไฟล์แล้วระบบจะอัปโหลดอัตโนมัติ</div>
+    <pre id="result"></pre>
+  </div>
+  <script>
+    const btn = document.getElementById("btn");
+    const fileInput = document.getElementById("file");
+    const result = document.getElementById("result");
+    const params = new URLSearchParams(window.location.search);
+    const token = params.get("token") || "";
+
+    async function uploadSelected() {
+      const f = fileInput.files && fileInput.files[0];
+      if (!f) return;
+      const fd = new FormData();
+      fd.append("file", f);
+      if (token) fd.append("token", token);
+      try {
+        const resp = await fetch("/mobile-image-upload-temp", { method: "POST", body: fd });
+        const data = await resp.json();
+        if (!resp.ok) throw new Error(data.detail || JSON.stringify(data));
+        result.className = "ok";
+        result.textContent = JSON.stringify(data, null, 2);
+        setTimeout(() => { try { window.close(); } catch (e) {} }, 500);
+      } catch (e) {
+        result.className = "err";
+        result.textContent = "Upload failed: " + e.message;
+      }
+    }
+
+    btn.onclick = uploadSelected;
+
+    fileInput.addEventListener("change", () => {
+      uploadSelected();
+    });
+
+    // Try to auto-open native file picker when the popup is opened by a user click.
+    window.addEventListener("load", () => {
+      setTimeout(() => {
+        try { fileInput.click(); } catch (e) {}
+      }, 80);
+    });
+  </script>
+</body>
+</html>
+"""
+
+
+@app.post("/mobile-image-upload-temp")
+async def mobile_image_upload_temp(
+    file: UploadFile = File(...),
+    token: str = Form(...),
+):
+    if file is None or not file.filename:
+        raise HTTPException(status_code=400, detail="Missing file")
+
+    if not token:
+        raise HTTPException(status_code=400, detail="Missing token")
+
+    safe_name = _safe_filename(file.filename)
+    file_type = _infer_file_type(safe_name)
+    os.makedirs(MOBILE_PICKER_UPLOAD_DIR, exist_ok=True)
+    timestamp = int(time.time())
+    saved_name = f"{timestamp}_{safe_name}"
+    saved_path = os.path.join(MOBILE_PICKER_UPLOAD_DIR, saved_name)
+
+    payload = await file.read()
+    if not payload:
+        raise HTTPException(status_code=400, detail="Empty file payload")
+
+    with open(saved_path, "wb") as f:
+        f.write(payload)
+
+    MOBILE_UPLOAD_RESULTS[token] = {
+        "file_path": saved_path,
+        "file_name": saved_name,
+        "file_type": file_type,
+    }
+
+    return {
+        "file_path": saved_path,
+        "file_name": saved_name,
+        "file_type": file_type,
+        "token": token,
+    }
+
+
+@app.get("/mobile-image-upload-temp-result")
+def mobile_image_upload_temp_result(token: str):
+    if not token:
+        raise HTTPException(status_code=400, detail="Missing token")
+    data = MOBILE_UPLOAD_RESULTS.get(token)
+    if not data:
+        raise HTTPException(status_code=404, detail="Not ready")
+    # delete after read to keep memory small
+    MOBILE_UPLOAD_RESULTS.pop(token, None)
+    return data
 
 
 @app.post("/contract-documents/upload", response_model=ContractDocument)
@@ -494,6 +625,48 @@ async def upload_contract_document(
         cursor.execute("SELECT * FROM contract_documents WHERE doc_id = %s", (doc_id,))
         new_document = cursor.fetchone()
         return new_document
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        conn.close()
+
+
+@app.post("/contract-documents/attach-existing", response_model=ContractDocument)
+def attach_existing_contract_document(payload: ContractDocumentAttachExistingRequest):
+    file_path = (payload.file_path or "").strip()
+    if not file_path:
+        raise HTTPException(status_code=400, detail="file_path is required")
+
+    if not os.path.exists(file_path):
+        raise HTTPException(status_code=404, detail=f"File not found: {file_path}")
+
+    file_type = (payload.file_type or _infer_file_type(file_path)).strip() or "unknown"
+
+    conn = get_connection()
+    if conn is None:
+        raise HTTPException(status_code=500, detail="Database connection failed")
+
+    try:
+        cursor = conn.cursor(dictionary=True)
+        cursor.execute("SELECT contract_id FROM contracts WHERE contract_id = %s", (payload.contract_id,))
+        exists = cursor.fetchone()
+        if not exists:
+            raise HTTPException(status_code=404, detail="Contract not found")
+
+        cursor.execute(
+            """
+            INSERT INTO contract_documents (contract_id, file_path, file_type, uploaded_at)
+            VALUES (%s, %s, %s, NOW())
+            """,
+            (payload.contract_id, file_path, file_type),
+        )
+        conn.commit()
+
+        doc_id = cursor.lastrowid
+        cursor.execute("SELECT * FROM contract_documents WHERE doc_id = %s", (doc_id,))
+        return cursor.fetchone()
     except HTTPException:
         raise
     except Exception as e:
